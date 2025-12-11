@@ -5,7 +5,7 @@ import url from 'url';
 const PORT = process.env.PORT || 10000;
 
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('Maze Race WS server is running\n');
 });
 
@@ -19,7 +19,9 @@ function broadcastRoomState(room) {
     winner: room.winner || null
   };
   const msg = JSON.stringify(payload);
-  room.players.forEach(p => { if (p.ws.readyState === 1) p.ws.send(msg); });
+  room.players.forEach(p => {
+    if (p.ws.readyState === 1) p.ws.send(msg);
+  });
 }
 
 server.on('upgrade', (request, socket, head) => {
@@ -50,7 +52,15 @@ wss.on('connection', (ws) => {
       const roomId = msg.roomId;
       const seed = Math.floor(Math.random() * 1e9);
       const w = 41, h = 41;
-      rooms.set(roomId, { players: [{ id, ws, x: 1, y: 1 }], seed, w, h, winner: null });
+
+      rooms.set(roomId, {
+        players: [{ id, ws, x: 1, y: 1 }],
+        seed,
+        w,
+        h,
+        winner: null
+      });
+
       console.log('createRoom:', roomId, 'by', id);
       ws.send(JSON.stringify({ type: 'roomCreated', roomId }));
     }
@@ -59,10 +69,12 @@ wss.on('connection', (ws) => {
       const roomId = msg.roomId;
       const room = rooms.get(roomId);
       console.log('joinRoom:', roomId, 'by', id, 'roomExists?', !!room);
+
       if (!room || room.players.length >= 2) {
         ws.send(JSON.stringify({ type: 'error', reason: 'room_not_found_or_full' }));
         return;
       }
+
       room.players.push({ id, ws, x: 1, y: 2 });
       ws.send(JSON.stringify({ type: 'roomJoined', roomId }));
 
