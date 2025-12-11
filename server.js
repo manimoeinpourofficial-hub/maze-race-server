@@ -1,293 +1,314 @@
-// ----- تنظیمات پایه
-const cell = 20;
-const wsUrl = "wss://maze-race-server.onrender.com/ws";
+import http from 'http';
+import { WebSocketServer } from 'ws';
+import url from 'url';
 
-let ws, maze, me, other, myId;
-let isConnected = false;
+const PORT = process.env.PORT || 10000;
 
-const cv = document.getElementById('cv');
-const ctx = cv.getContext('2d');
-const statusEl = document.getElementById('status');
-const roomInput = document.getElementById('roomId');
-const createBtn = document.getElementById('createBtn');
-const joinBtn = document.getElementById('joinBtn');
+const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 دقیقه
 
-// ----- PRNG و تولید هزارتو
-function mulberry32(seed){
-  return function(){
-    seed |= 0;
-    seed = seed + 0x6D2B79F5 | 0;
-    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
-}
-
-function generateMaze(w, h, seed){
-  const rnd = mulberry32(seed);
-  const grid = Array.from({length: h}, () => Array(w).fill(1));
-  const dirs = [[0,-2],[0,2],[-2,0],[2,0]];
-  const sx = 1, sy = 1;
-  grid[sy][sx] = 0;
-
-  function shuffle(a){
-    for (let i = a.length - 1; i > 0; i--){
-      const j = Math.floor(rnd() * (i + 1));
-      [a[i], a[j]] = [a[j], a[i]];
-    }
-    return a;
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
   }
 
-  function carve(x, y){
-    shuffle(dirs).forEach(([dx, dy]) => {
-      const nx = x + dx;
-      const ny = y + dy;
-      if (
-        ny > 0 && ny < h - 1 &&
-        nx > 0 && nx < w - 1 &&
-        grid[ny][nx] === 1
-      ) {
-        grid[y + dy / 2][x + dx / 2] = 0;
-        grid[ny][nx] = 0;
-        carve(nx, ny);
-      }
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Maze Race WS server is running\n');
+});
+
+const wss = new WebSocketServer({ noServer: true });
+
+/**
+ * rooms: Map<roomId, {
+ *   roomId: string,
+ *   password: string | null,
+ *   maxPlayers: number,
+ *   players: Array<{ playerId, ws, x, y }>,
+ *   seed: number,
+ *   w: number,
+ *   h: number,
+ *   winner: string | null,
+ *   lastActivity: number
+ * }>
+ */
+const rooms = new Map();
+
+/** playerId → { roomId, playerIndex } */
+const playerIndexMap = new Map();
+
+function now() {
+  return Date.now();
+}
+
+function touchRoom(room) {
+  room.lastActivity = now();
+}
+
+function broadcastRoomState(room) {
+  const payload = {
+    type: 'state',
+    players: room.players.map(p => ({ id: p.playerId, x: p.x, y: p.y })),
+    winner: room.winner || null
+  };
+  const msg = JSON.stringify(payload);
+  room.players.forEach(p => {
+    if (p.ws.readyState === 1) {
+      p.ws.send(msg);
+    }
+  });
+}
+
+function sendRoomList(ws) {
+  const list = [];
+  for (const [id, room] of rooms.entries()) {
+    list.push({
+      roomId: id,
+      playerCount: room.players.length,
+      maxPlayers: room.maxPlayers,
+      hasPassword: !!room.password
     });
   }
-
-  carve(sx, sy);
-
-  return {
-    grid,
-    start: { x: 1, y: 1 },
-    exit: { x: w - 2, y: h - 2 }
-  };
+  ws.send(JSON.stringify({ type: 'roomList', rooms: list }));
 }
 
-// ----- حرکت و برخورد
-function canMove(x, y){
-  return maze && maze.grid[y]?.[x] === 0;
-}
-
-function tryMove(p, dx, dy){
-  const nx = p.x + dx;
-  const ny = p.y + dy;
-  if (canMove(nx, ny)){
-    p.x = nx;
-    p.y = ny;
-  }
-}
-
-// ----- رندر
-function draw(){
-  if (!maze || !maze.grid) return;
-
-  ctx.clearRect(0, 0, cv.width, cv.height);
-
-  // دیوارها و راه‌ها
-  for (let y = 0; y < maze.grid.length; y++){
-    for (let x = 0; x < maze.grid[0].length; x++){
-      ctx.fillStyle = maze.grid[y][x] ? '#333' : '#111';
-      ctx.fillRect(x * cell, y * cell, cell, cell);
+function cleanupRooms() {
+  const t = now();
+  for (const [id, room] of rooms.entries()) {
+    if (room.players.length === 0) {
+      rooms.delete(id);
+      console.log('Room deleted (empty):', id);
+      continue;
+    }
+    if (t - room.lastActivity > INACTIVITY_TIMEOUT) {
+      console.log('Room deleted (inactive):', id);
+      room.players.forEach(p => {
+        if (p.ws.readyState === 1) {
+          p.ws.send(JSON.stringify({ type: 'roomClosed', reason: 'inactive' }));
+          p.ws.close();
+        }
+      });
+      rooms.delete(id);
     }
   }
-
-  // خروج
-  ctx.fillStyle = '#3c3';
-  ctx.fillRect(maze.exit.x * cell, maze.exit.y * cell, cell, cell);
-
-  // خودت
-  if (me){
-    ctx.fillStyle = me.color;
-    ctx.beginPath();
-    ctx.arc(
-      me.x * cell + cell / 2,
-      me.y * cell + cell / 2,
-      cell * 0.4,
-      0,
-      Math.PI * 2
-    );
-    ctx.fill();
-  }
-
-  // حریف
-  if (other){
-    ctx.fillStyle = other.color;
-    ctx.beginPath();
-    ctx.arc(
-      other.x * cell + cell / 2,
-      other.y * cell + cell / 2,
-      cell * 0.4,
-      0,
-      Math.PI * 2
-    );
-    ctx.fill();
-  }
 }
 
-// ----- حلقه بازی
-function loop(){
-  draw();
-  requestAnimationFrame(loop);
-}
+setInterval(cleanupRooms, 60 * 1000); // هر 1 دقیقه چک کن
 
-// ----- ارسال به سرور
-function send(obj){
-  if (ws && ws.readyState === 1){
-    ws.send(JSON.stringify(obj));
+server.on('upgrade', (request, socket, head) => {
+  const { pathname } = url.parse(request.url);
+  if (pathname === '/ws') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
   } else {
-    console.log('WS NOT READY, drop message:', obj);
-  }
-}
-
-// ----- کنترل لمسی (موبایل)
-cv.addEventListener('touchstart', handleTouch, { passive: false });
-cv.addEventListener('touchmove', handleTouch, { passive: false });
-
-function handleTouch(e){
-  e.preventDefault();
-  if (!me || !maze) return;
-
-  const touch = e.touches[0];
-  const rect = cv.getBoundingClientRect();
-  const tx = touch.clientX - rect.left;
-  const ty = touch.clientY - rect.top;
-
-  const px = me.x * cell + cell / 2;
-  const py = me.y * cell + cell / 2;
-
-  const dx = tx - px;
-  const dy = ty - py;
-
-  if (Math.abs(dx) > Math.abs(dy)) {
-    if (dx > 0) tryMove(me, 1, 0);
-    else        tryMove(me, -1, 0);
-  } else {
-    if (dy > 0) tryMove(me, 0, 1);
-    else        tryMove(me, 0, -1);
-  }
-
-  send({ type: 'move', payload: { x: me.x, y: me.y } });
-
-  if (me.x === maze.exit.x && me.y === maze.exit.y){
-    send({ type: 'win' });
-  }
-}
-
-// ----- کنترل کیبورد (کامپیوتر)
-document.addEventListener('keydown', (e) => {
-  if (!me || !maze) return;
-
-  let moved = false;
-
-  if (e.key === 'ArrowUp' || e.key === 'w')    { tryMove(me, 0, -1); moved = true; }
-  if (e.key === 'ArrowDown' || e.key === 's')  { tryMove(me, 0, 1);  moved = true; }
-  if (e.key === 'ArrowLeft' || e.key === 'a')  { tryMove(me, -1, 0); moved = true; }
-  if (e.key === 'ArrowRight' || e.key === 'd') { tryMove(me, 1, 0);  moved = true; }
-
-  if (!moved) return;
-
-  send({ type: 'move', payload: { x: me.x, y: me.y } });
-
-  if (me.x === maze.exit.x && me.y === maze.exit.y){
-    send({ type: 'win' });
+    socket.destroy();
   }
 });
 
-// ----- اتصال به WebSocket
-function connect(){
-  ws = new WebSocket(wsUrl);
-  statusEl.textContent = 'در حال اتصال به سرور...';
+wss.on('connection', (ws) => {
+  const playerId = Math.random().toString(36).slice(2);
+  console.log('Client connected:', playerId);
 
-  ws.onopen = () => {
-    isConnected = true;
-    statusEl.textContent = 'وصل شد. یک اتاق بساز یا وارد شو.';
-  };
+  ws.send(JSON.stringify({ type: 'welcome', playerId }));
+  sendRoomList(ws);
 
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    console.log('WS MSG:', msg);
-
-    if (msg.type === 'welcome'){
-      myId = msg.id;
-      console.log('My id:', myId);
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); }
+    catch {
+      console.log('Bad JSON from', playerId, '=>', raw.toString());
+      return;
     }
 
-    if (msg.type === 'roomCreated'){
-      statusEl.textContent = `اتاق ساخته شد: ${msg.roomId}`;
-      roomInput.value = msg.roomId;   // اتومات در input بذار برای دستگاه دوم
-    }
+    if (msg.type === 'createRoom') {
+      const roomId = msg.roomId;
+      const password = msg.password ? String(msg.password) : null;
+      let maxPlayers = Number(msg.maxPlayers) || 2;
+      if (maxPlayers < 1) maxPlayers = 1;
+      if (maxPlayers > 8) maxPlayers = 8;
 
-    if (msg.type === 'roomJoined'){
-      statusEl.textContent = `ورود به اتاق: ${msg.roomId}`;
-    }
+      if (rooms.has(roomId)) {
+        ws.send(JSON.stringify({ type: 'error', reason: 'room_already_exists' }));
+        return;
+      }
 
-    if (msg.type === 'start'){
-      maze = generateMaze(msg.w, msg.h, msg.seed);
-      const p1 = maze.start;
-      const p2 = { x: maze.start.x, y: maze.start.y + 1 };
-      const isP1 = (msg.playerIndex === 0);
+      const seed = Math.floor(Math.random() * 1e9);
+      const w = 41, h = 41;
 
-      me = {
-        x: isP1 ? p1.x : p2.x,
-        y: isP1 ? p1.y : p2.y,
-        color: isP1 ? '#39f' : '#f93'
+      const room = {
+        roomId,
+        password,
+        maxPlayers,
+        players: [],
+        seed,
+        w,
+        h,
+        winner: null,
+        lastActivity: now()
       };
 
-      other = {
-        x: isP1 ? p2.x : p1.x,
-        y: isP1 ? p2.y : p1.y,
-        color: isP1 ? '#f93' : '#39f'
-      };
+      const player = { playerId, ws, x: 1, y: 1 };
+      room.players.push(player);
+      rooms.set(roomId, room);
+      playerIndexMap.set(playerId, { roomId, playerIndex: 0 });
 
-      statusEl.textContent = 'بازی شروع شد!';
+      console.log('createRoom:', roomId, 'by', playerId, 'maxPlayers:', maxPlayers);
+      ws.send(JSON.stringify({
+        type: 'roomCreated',
+        roomId,
+        maxPlayers,
+        hasPassword: !!password
+      }));
+      sendRoomListToAll();
     }
 
-    if (msg.type === 'state'){
-      const o = msg.players.find(p => p.id !== myId);
-      if (o && other){
-        other.x = o.x;
-        other.y = o.y;
+    else if (msg.type === 'joinRoom') {
+      const roomId = msg.roomId;
+      const password = msg.password || null;
+      const rejoinPlayerId = msg.playerId || playerId;
+
+      const room = rooms.get(roomId);
+      console.log('joinRoom:', roomId, 'by', playerId, 'as', rejoinPlayerId, 'roomExists?', !!room);
+
+      if (!room) {
+        ws.send(JSON.stringify({ type: 'error', reason: 'room_not_found' }));
+        return;
       }
-      if (msg.winner){
-        statusEl.textContent = (msg.winner === myId) ? 'بردی!' : 'حریف برد';
+
+      if (room.password && room.password !== password) {
+        ws.send(JSON.stringify({ type: 'error', reason: 'wrong_password' }));
+        return;
+      }
+
+      // Rejoin
+      let existingIndex = room.players.findIndex(p => p.playerId === rejoinPlayerId);
+      if (existingIndex !== -1) {
+        room.players[existingIndex].ws = ws;
+        playerIndexMap.set(rejoinPlayerId, { roomId, playerIndex: existingIndex });
+        ws.send(JSON.stringify({
+          type: 'roomJoined',
+          roomId,
+          rejoin: true,
+          playerIndex: existingIndex
+        }));
+
+        // دوباره start برای این بازیکن
+        ws.send(JSON.stringify({
+          type: 'start',
+          seed: room.seed,
+          w: room.w,
+          h: room.h,
+          playerIndex: existingIndex
+        }));
+
+        touchRoom(room);
+        return;
+      }
+
+      // Join جدید
+      if (room.players.length >= room.maxPlayers) {
+        ws.send(JSON.stringify({ type: 'error', reason: 'room_full' }));
+        return;
+      }
+
+      const newIndex = room.players.length;
+      const player = { playerId, ws, x: 1, y: 1 + newIndex };
+      room.players.push(player);
+      playerIndexMap.set(playerId, { roomId, playerIndex: newIndex });
+      touchRoom(room);
+
+      ws.send(JSON.stringify({
+        type: 'roomJoined',
+        roomId,
+        rejoin: false,
+        playerIndex: newIndex
+      }));
+
+      // برای همه‌ی بازیکن‌های اتاق start بفرست
+      room.players.forEach((p, idx) => {
+        if (p.ws.readyState === 1) {
+          p.ws.send(JSON.stringify({
+            type: 'start',
+            seed: room.seed,
+            w: room.w,
+            h: room.h,
+            playerIndex: idx
+          }));
+        }
+      });
+    }
+
+    else if (msg.type === 'move') {
+      const info = playerIndexMap.get(playerId);
+      if (!info) return;
+      const room = rooms.get(info.roomId);
+      if (!room) return;
+
+      const p = room.players[info.playerIndex];
+      if (!p) return;
+
+      p.x = msg.payload.x;
+      p.y = msg.payload.y;
+      touchRoom(room);
+      broadcastRoomState(room);
+    }
+
+    else if (msg.type === 'win') {
+      const info = playerIndexMap.get(playerId);
+      if (!info) return;
+      const room = rooms.get(info.roomId);
+      if (!room) return;
+
+      if (!room.winner) {
+        room.winner = playerId;
+        touchRoom(room);
+        broadcastRoomState(room);
       }
     }
 
-    if (msg.type === 'error'){
-      statusEl.textContent = 'اتاق پیدا نشد یا پر است';
+    else if (msg.type === 'getRooms') {
+      sendRoomList(ws);
     }
-  };
+  });
 
-  ws.onclose = () => {
-    isConnected = false;
-    statusEl.textContent = 'ارتباط قطع شد';
-  };
+  ws.on('close', () => {
+    console.log('Client disconnected:', playerId);
+
+    // پاک کردن از playerIndexMap، حذف از rooms اگر ws قطع شد
+    const info = playerIndexMap.get(playerId);
+    if (!info) return;
+
+    const room = rooms.get(info.roomId);
+    if (!room) {
+      playerIndexMap.delete(playerId);
+      return;
+    }
+
+    // ws رو فقط قطع شده علامت می‌زنیم، ولی playerId می‌مونه برای rejoin
+    room.players[info.playerIndex].ws = { readyState: 3 }; // CLOSED
+
+    // اگر همه قطع شده‌ن، بعد از timeout پاک می‌شه
+    playerIndexMap.delete(playerId);
+  });
+});
+
+function sendRoomListToAll() {
+  const list = [];
+  for (const [id, room] of rooms.entries()) {
+    list.push({
+      roomId: id,
+      playerCount: room.players.length,
+      maxPlayers: room.maxPlayers,
+      hasPassword: !!room.password
+    });
+  }
+  const msg = JSON.stringify({ type: 'roomList', rooms: list });
+  wss.clients.forEach(c => {
+    if (c.readyState === 1) c.send(msg);
+  });
 }
 
-// ----- دکمه‌ها (ساخت/ورود اتاق)
-createBtn.onclick = () => {
-  if (!isConnected){
-    statusEl.textContent = 'هنوز به سرور وصل نشدی';
-    return;
-  }
-  const rid = Math.random().toString(36).slice(2, 7);
-  roomInput.value = rid;
-  send({ type: 'createRoom', roomId: rid });
-};
-
-joinBtn.onclick = () => {
-  if (!isConnected){
-    statusEl.textContent = 'هنوز به سرور وصل نشدی';
-    return;
-  }
-  const rid = roomInput.value.trim();
-  if (!rid){
-    statusEl.textContent = 'کد اتاق را وارد کن';
-    return;
-  }
-  send({ type: 'joinRoom', roomId: rid });
-};
-
-// ----- شروع بازی
-connect();
-requestAnimationFrame(loop);
+server.listen(PORT, () => {
+  console.log(`WS server on :${PORT} (path /ws)`);
+});
